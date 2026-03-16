@@ -181,10 +181,6 @@ class LatentFrequencyEnhancer_lrzjason:
     RETURN_NAMES = ("enhanced_latent", "mask_preview")
     FUNCTION = "enhance"
     CATEGORY = "latent/enhancement"
-    
-    @classmethod
-    def IS_CHANGED(cls, *args, **kwargs):
-        return float("nan")
 
     def enhance(self, latent, high_freq_mult, sigma, denoise_threshold, mask_hardness, hf_pre_blur_sigma):
         return HighFrequencyEnhancer(latent, high_freq_mult, sigma, denoise_threshold, mask_hardness, hf_pre_blur_sigma)
@@ -234,10 +230,6 @@ class LatentGaussianBlur_lrzjason:
     RETURN_NAMES = ("blurred_latent", "mask_preview")
     FUNCTION = "apply_blur"
     CATEGORY = "latent/enhancement"
-    
-    @classmethod
-    def IS_CHANGED(cls, *args, **kwargs):
-        return float("nan")
 
     def apply_blur(self, latent, sigma, edge_masking, edge_threshold, edge_hardness):
         samples = latent["samples"].clone()
