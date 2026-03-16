@@ -13,7 +13,6 @@ import comfy.utils
 import latent_preview
 
 
-
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
@@ -126,6 +125,7 @@ def HighFrequencyEnhancer(latent, high_freq_mult, sigma, denoise_threshold, mask
 
     return (enhanced_latent, mask_preview)
 
+
 class LatentFrequencyEnhancer_lrzjason:
     """
     ComfyUI Node for selective latent denoising and enhancement using FFT.
@@ -189,9 +189,106 @@ class LatentFrequencyEnhancer_lrzjason:
     def enhance(self, latent, high_freq_mult, sigma, denoise_threshold, mask_hardness, hf_pre_blur_sigma):
         return HighFrequencyEnhancer(latent, high_freq_mult, sigma, denoise_threshold, mask_hardness, hf_pre_blur_sigma)
         
-# Register the node
-NODE_CLASS_MAPPINGS["LatentFrequencyEnhancer_lrzjason"] = LatentFrequencyEnhancer_lrzjason
-NODE_DISPLAY_NAME_MAPPINGS["LatentFrequencyEnhancer_lrzjason"] = "Latent Frequency Enhancer (lrzjason)"
+
+class LatentGaussianBlur_lrzjason:
+    """
+    ComfyUI Node to directly apply a Gaussian blur to a latent.
+    Includes an optional edge-aware mask that applies the blur strongest at sudden, crisp edges.
+    Outputs the processing mask as a preview image.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "sigma": ("FLOAT", {
+                    "default": 2.0,
+                    "min": 0.1,
+                    "max": 50.0,
+                    "step": 0.1,
+                    "label": "Blur Sigma"
+                }),
+                "edge_masking": ("BOOLEAN", {
+                    "default": False,
+                    "label": "Enable Edge Masking"
+                }),
+                "edge_threshold": ("FLOAT", {
+                    "default": 0.05,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.001,
+                    "label": "Edge Threshold"
+                }),
+                "edge_hardness": ("FLOAT", {
+                    "default": 20.0,
+                    "min": 1.0,
+                    "max": 100.0,
+                    "step": 1.0,
+                    "label": "Edge Mask Hardness"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "IMAGE")
+    RETURN_NAMES = ("blurred_latent", "mask_preview")
+    FUNCTION = "apply_blur"
+    CATEGORY = "latent/enhancement"
+    
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return float("nan")
+
+    def apply_blur(self, latent, sigma, edge_masking, edge_threshold, edge_hardness):
+        samples = latent["samples"].clone()
+        
+        # Handle WAN format if needed
+        is_wan = False
+        if samples.ndim == 5:
+            samples = samples.squeeze(2)
+            is_wan = True
+            
+        batch_size, channels, height, width = samples.shape
+        device = samples.device
+        
+        # 1. Create Gaussian blur via FFT (Low-pass filter)
+        gaussian_filter = create_gaussian_filter(height, width, sigma, device)
+        gaussian_filter = gaussian_filter.view(1, 1, height, width)
+        
+        fft_latent = torch.fft.fft2(samples, dim=(-2, -1))
+        fft_shifted = torch.fft.fftshift(fft_latent, dim=(-2, -1))
+        
+        low_freq_fft = fft_shifted * gaussian_filter
+        low_freq_shifted = torch.fft.ifftshift(low_freq_fft, dim=(-2, -1))
+        blurred_samples = torch.fft.ifft2(low_freq_shifted, dim=(-2, -1)).real
+        
+        # 2. Apply Edge Masking if enabled
+        if edge_masking:
+            # Edges are represented by the high-frequency components
+            high_freq = samples - blurred_samples
+            magnitude = torch.abs(high_freq)
+            
+            # Create mask: approaching 1 near strong edges, 0 in flat areas
+            mask = torch.sigmoid((magnitude - edge_threshold) * edge_hardness)
+            
+            # Apply blur proportionally (100% blurred where mask is strong)
+            final_samples = samples * (1.0 - mask) + blurred_samples * mask
+        else:
+            final_samples = blurred_samples
+            mask = torch.ones_like(samples)
+            
+        # 3. Prepare Latent Output
+        blurred_latent = latent.copy()
+        if is_wan:
+            final_samples = final_samples.unsqueeze(2)
+        blurred_latent["samples"] = final_samples
+        
+        # 4. Prepare Mask Preview Output
+        mask_preview = torch.mean(mask, dim=1, keepdim=True)  # [B, 1, H, W]
+        mask_preview = mask_preview.repeat(1, 3, 1, 1)        # [B, 3, H, W]
+        mask_preview = mask_preview.permute(0, 2, 3, 1)       # [B, H, W, 3]
+        
+        return (blurred_latent, mask_preview)
 
 
 class HFEPostProcessor:
@@ -296,6 +393,13 @@ class HFEPostProcessor:
             
         return (latent, )
 
+
+# Register the nodes
+NODE_CLASS_MAPPINGS["LatentFrequencyEnhancer_lrzjason"] = LatentFrequencyEnhancer_lrzjason
+NODE_DISPLAY_NAME_MAPPINGS["LatentFrequencyEnhancer_lrzjason"] = "Latent Frequency Enhancer (lrzjason)"
+
+NODE_CLASS_MAPPINGS["LatentGaussianBlur_lrzjason"] = LatentGaussianBlur_lrzjason
+NODE_DISPLAY_NAME_MAPPINGS["LatentGaussianBlur_lrzjason"] = "Latent Gaussian Blur (lrzjason)"
 
 NODE_CLASS_MAPPINGS["HFEPostProcessor (lrzjason)"] = HFEPostProcessor
 NODE_DISPLAY_NAME_MAPPINGS["HFEPostProcessor (lrzjason)"] = "HFEPostProcessor (lrzjason)"
