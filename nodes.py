@@ -231,6 +231,71 @@ class LatentGaussianBlur_lrzjason:
         return (blurred_latent, mask_preview)
 
 
+class LatentColorAdjust_lrzjason:
+    """
+    ComfyUI Node to adjust the contrast and saturation directly within the latent space.
+    Channel 0 roughly represents Luminance (where contrast is applied).
+    Channels 1+ roughly represent Chroma (where saturation is applied).
+    """
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "contrast": ("FLOAT", {
+                    "default": 1.0, 
+                    "min": 0.0, 
+                    "max": 3.0, 
+                    "step": 0.01, 
+                    "label": "Contrast"
+                }),
+                "saturation": ("FLOAT", {
+                    "default": 1.0, 
+                    "min": 0.0, 
+                    "max": 3.0, 
+                    "step": 0.01, 
+                    "label": "Saturation"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("adjusted_latent",)
+    FUNCTION = "adjust_color"
+    CATEGORY = "latent/enhancement"
+
+    def adjust_color(self, latent, contrast, saturation):
+        samples = latent["samples"].clone()
+        
+        # Handle WAN format if needed
+        is_wan = False
+        if samples.ndim == 5:
+            samples = samples.squeeze(2)
+            is_wan = True
+            
+        # --- 1. Contrast Adjustment ---
+        # Contrast scales the variance around the mean of each channel
+        if contrast != 1.0:
+            # Calculate the spatial mean of the latents [Batch, Channels, 1, 1]
+            mean = samples.mean(dim=[-2, -1], keepdim=True)
+            samples = (samples - mean) * contrast + mean
+            
+        # --- 2. Saturation Adjustment ---
+        # Color data is stored in the channels following channel 0.
+        # Multiplying these channels boosts color purity/saturation.
+        if saturation != 1.0 and samples.shape[1] > 1:
+            samples[:, 1:] = samples[:, 1:] * saturation
+            
+        # Prepare Latent Output
+        adjusted_latent = latent.copy()
+        if is_wan:
+            samples = samples.unsqueeze(2)
+        adjusted_latent["samples"] = samples
+        
+        return (adjusted_latent,)
+
+
 class HFEPostProcessor:
     """
     Custom sampler with high-frequency enhancement during sampling process.
@@ -291,6 +356,9 @@ NODE_DISPLAY_NAME_MAPPINGS["LatentFrequencyEnhancer_lrzjason"] = "Latent Frequen
 
 NODE_CLASS_MAPPINGS["LatentGaussianBlur_lrzjason"] = LatentGaussianBlur_lrzjason
 NODE_DISPLAY_NAME_MAPPINGS["LatentGaussianBlur_lrzjason"] = "Latent Gaussian Blur (lrzjason)"
+
+NODE_CLASS_MAPPINGS["LatentColorAdjust_lrzjason"] = LatentColorAdjust_lrzjason
+NODE_DISPLAY_NAME_MAPPINGS["LatentColorAdjust_lrzjason"] = "Latent Color Adjust (lrzjason)"
 
 NODE_CLASS_MAPPINGS["HFEPostProcessor (lrzjason)"] = HFEPostProcessor
 NODE_DISPLAY_NAME_MAPPINGS["HFEPostProcessor (lrzjason)"] = "HFEPostProcessor (lrzjason)"
