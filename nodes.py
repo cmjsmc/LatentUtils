@@ -18,7 +18,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {}
 
 
 def create_gaussian_filter(height, width, sigma, device):
-    """Create Gaussian filter in frequency domain"""
+    """Create Gaussian filter in frequency domain for FFT split"""
     # Create frequency grids
     u = torch.linspace(-0.5, 0.5, height, device=device)
     v = torch.linspace(-0.5, 0.5, width, device=device)
@@ -32,6 +32,40 @@ def create_gaussian_filter(height, width, sigma, device):
     gaussian = torch.exp(-2 * (pi**2) * (sigma**2) * D2)
     
     return gaussian
+
+def apply_spatial_gaussian_blur(tensor, sigma):
+    """
+    Applies a spatial Gaussian blur. Much more accurate and artifact-free 
+    for small blur radii compared to FFT (avoids edge wrap-around).
+    """
+    if sigma <= 0.0:
+        return tensor
+        
+    device = tensor.device
+    channels = tensor.shape[1]
+    
+    # Calculate kernel size based on sigma (3 sigma rule)
+    k_size = int(2 * round(3.0 * sigma) + 1)
+    if k_size < 3:
+        k_size = 3
+        
+    # Create 1D Gaussian kernel
+    x = torch.arange(k_size, dtype=torch.float32, device=device) - k_size // 2
+    kernel_1d = torch.exp(-0.5 * (x / sigma) ** 2)
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    
+    # Create 2D kernel
+    kernel_2d = kernel_1d.view(1, 1, -1, 1) * kernel_1d.view(1, 1, 1, -1)
+    
+    # Expand kernel for all channels (depthwise convolution)
+    kernel_2d = kernel_2d.expand(channels, 1, k_size, k_size)
+    
+    # Pad and convolve
+    pad = k_size // 2
+    padded = F.pad(tensor, (pad, pad, pad, pad), mode='reflect')
+    blurred = F.conv2d(padded, kernel_2d, groups=channels)
+    
+    return blurred
 
 
 def HighFrequencyEnhancer(latent, high_freq_mult, sigma, denoise_threshold, mask_hardness, hf_pre_blur_sigma):
@@ -70,28 +104,9 @@ def HighFrequencyEnhancer(latent, high_freq_mult, sigma, denoise_threshold, mask
 
     # --- Smart Mask Generation ---
     if denoise_threshold > 0:
-        # Pre-blur for noise grouping if enabled
+        # Pre-blur for noise grouping if enabled (using optimized spatial blur)
         if hf_pre_blur_sigma > 0.0:
-            # Calculate kernel size based on sigma
-            k_size = int(2 * round(3 * hf_pre_blur_sigma) + 1)
-            if k_size % 2 == 0:
-                k_size += 1
-            
-            # Create 1D Gaussian kernel
-            kernel_1d = torch.arange(k_size, device=device) - k_size // 2
-            kernel_1d = torch.exp(-0.5 * (kernel_1d / hf_pre_blur_sigma) ** 2)
-            kernel_1d = kernel_1d / kernel_1d.sum()
-            
-            # Create 2D kernel
-            kernel_2d = kernel_1d.view(1, 1, -1, 1) * kernel_1d.view(1, 1, 1, -1)
-            
-            # Apply to each channel separately
-            high_freq_detection = torch.zeros_like(high_freq_original)
-            for c in range(channels):
-                channel = high_freq_original[:, c:c+1]
-                # Manual convolution with reflection padding
-                padded = F.pad(channel, (k_size//2, k_size//2, k_size//2, k_size//2), mode='reflect')
-                high_freq_detection[:, c:c+1] = F.conv2d(padded, kernel_2d, padding=0)
+            high_freq_detection = apply_spatial_gaussian_blur(high_freq_original, hf_pre_blur_sigma)
         else:
             high_freq_detection = high_freq_original
 
@@ -129,9 +144,6 @@ def HighFrequencyEnhancer(latent, high_freq_mult, sigma, denoise_threshold, mask
 class LatentFrequencyEnhancer_lrzjason:
     """
     ComfyUI Node for selective latent denoising and enhancement using FFT.
-    Uses frequency separation via FFT to isolate details and a Sigmoid Soft-Gate mask 
-    to smoothly eliminate background noise while preserving sharp features.
-    Outputs the processing mask as a preview image.
     """
     
     @classmethod
@@ -139,41 +151,11 @@ class LatentFrequencyEnhancer_lrzjason:
         return {
             "required": {
                 "latent": ("LATENT",),
-                "high_freq_mult": ("FLOAT", {
-                    "default": 1.15, 
-                    "min": 1.0,
-                    "max": 2.0,
-                    "step": 0.01,
-                    "label": "Detail Strength (HF Mult)"
-                }),
-                "sigma": ("FLOAT", {
-                    "default": 2.0,
-                    "min": 0.1,
-                    "max": 20.0,
-                    "step": 0.1,
-                    "label": "Frequency Split Sigma"
-                }),
-                "denoise_threshold": ("FLOAT", {
-                    "default": 0.05,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.001,
-                    "label": "Noise Threshold"
-                }),
-                "mask_hardness": ("FLOAT", {
-                    "default": 2.0,
-                    "min": 1.0,
-                    "max": 100.0,
-                    "step": 1.0,
-                    "label": "Mask Hardness (Transition)"
-                }),
-                "hf_pre_blur_sigma": ("FLOAT", {
-                    "default": 0.5, 
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.01,
-                    "label": "Noise Grouping (Pre-Blur)"
-                }),
+                "high_freq_mult": ("FLOAT", {"default": 1.15, "min": 1.0, "max": 2.0, "step": 0.01, "label": "Detail Strength (HF Mult)"}),
+                "sigma": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 20.0, "step": 0.01, "label": "Frequency Split Sigma"}),
+                "denoise_threshold": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.001, "label": "Noise Threshold"}),
+                "mask_hardness": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 100.0, "step": 1.0, "label": "Mask Hardness (Transition)"}),
+                "hf_pre_blur_sigma": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 10.0, "step": 0.01, "label": "Noise Grouping (Pre-Blur)"}),
             },
         }
 
@@ -181,7 +163,7 @@ class LatentFrequencyEnhancer_lrzjason:
     RETURN_NAMES = ("enhanced_latent", "mask_preview")
     FUNCTION = "enhance"
     CATEGORY = "latent/enhancement"
-
+    
     def enhance(self, latent, high_freq_mult, sigma, denoise_threshold, mask_hardness, hf_pre_blur_sigma):
         return HighFrequencyEnhancer(latent, high_freq_mult, sigma, denoise_threshold, mask_hardness, hf_pre_blur_sigma)
         
@@ -189,8 +171,6 @@ class LatentFrequencyEnhancer_lrzjason:
 class LatentGaussianBlur_lrzjason:
     """
     ComfyUI Node to directly apply a Gaussian blur to a latent.
-    Includes an optional edge-aware mask that applies the blur strongest at sudden, crisp edges.
-    Outputs the processing mask as a preview image.
     """
     
     @classmethod
@@ -198,31 +178,10 @@ class LatentGaussianBlur_lrzjason:
         return {
             "required": {
                 "latent": ("LATENT",),
-                "sigma": ("FLOAT", {
-                    "default": 2.0,
-                    "min": 0.1,
-                    "max": 50.0,
-                    "step": 0.1,
-                    "label": "Blur Sigma"
-                }),
-                "edge_masking": ("BOOLEAN", {
-                    "default": False,
-                    "label": "Enable Edge Masking"
-                }),
-                "edge_threshold": ("FLOAT", {
-                    "default": 0.05,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.001,
-                    "label": "Edge Threshold"
-                }),
-                "edge_hardness": ("FLOAT", {
-                    "default": 20.0,
-                    "min": 1.0,
-                    "max": 100.0,
-                    "step": 1.0,
-                    "label": "Edge Mask Hardness"
-                }),
+                "sigma": ("FLOAT", {"default": 0.5, "min": 0.01, "max": 20.0, "step": 0.01, "label": "Blur Sigma"}),
+                "edge_masking": ("BOOLEAN", {"default": False, "label": "Enable Edge Masking"}),
+                "edge_threshold": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.001, "label": "Edge Threshold"}),
+                "edge_hardness": ("FLOAT", {"default": 20.0, "min": 1.0, "max": 100.0, "step": 1.0, "label": "Edge Mask Hardness"}),
             },
         }
 
@@ -230,7 +189,7 @@ class LatentGaussianBlur_lrzjason:
     RETURN_NAMES = ("blurred_latent", "mask_preview")
     FUNCTION = "apply_blur"
     CATEGORY = "latent/enhancement"
-
+    
     def apply_blur(self, latent, sigma, edge_masking, edge_threshold, edge_hardness):
         samples = latent["samples"].clone()
         
@@ -240,19 +199,8 @@ class LatentGaussianBlur_lrzjason:
             samples = samples.squeeze(2)
             is_wan = True
             
-        batch_size, channels, height, width = samples.shape
-        device = samples.device
-        
-        # 1. Create Gaussian blur via FFT (Low-pass filter)
-        gaussian_filter = create_gaussian_filter(height, width, sigma, device)
-        gaussian_filter = gaussian_filter.view(1, 1, height, width)
-        
-        fft_latent = torch.fft.fft2(samples, dim=(-2, -1))
-        fft_shifted = torch.fft.fftshift(fft_latent, dim=(-2, -1))
-        
-        low_freq_fft = fft_shifted * gaussian_filter
-        low_freq_shifted = torch.fft.ifftshift(low_freq_fft, dim=(-2, -1))
-        blurred_samples = torch.fft.ifft2(low_freq_shifted, dim=(-2, -1)).real
+        # 1. Apply Spatial Gaussian Blur (optimized for small, exact radii)
+        blurred_samples = apply_spatial_gaussian_blur(samples, sigma)
         
         # 2. Apply Edge Masking if enabled
         if edge_masking:
@@ -286,7 +234,6 @@ class LatentGaussianBlur_lrzjason:
 class HFEPostProcessor:
     """
     Custom sampler with high-frequency enhancement during sampling process.
-    Runs sampling steps in a loop and applies HighFrequencyEnhancer at specified steps.
     """
     
     @classmethod
@@ -294,81 +241,33 @@ class HFEPostProcessor:
         return {"required":
                     {
                         "model": ("MODEL",),
-                        # "add_noise": (["enable", "disable"], ),
                         "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
                         "steps": ("INT", {"default": 8, "min": 1, "max": 10000}),
                         "latent_image": ("LATENT", ),
-                        "hfe_steps": ("INT", {
-                            "default": 2,
-                            "min": 1,
-                            "max": 100,
-                            "step": 1,
-                            "label": "Start HFE Step"
-                        }),
+                        "hfe_steps": ("INT", {"default": 2, "min": 1, "max": 100, "step": 1, "label": "Start HFE Step"}),
                         "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step":0.1, "round": 0.01}),
                         "sampler_name": (comfy.samplers.KSampler.SAMPLERS, ),
                         "scheduler": (comfy.samplers.KSampler.SCHEDULERS, ),
                         "positive": ("CONDITIONING", ),
                         "negative": ("CONDITIONING", ),
-                        "high_freq_mult": ("FLOAT", {
-                            "default": 1.05, 
-                            "min": 1.0,
-                            "max": 2.0,
-                            "step": 0.01,
-                            "label": "Detail Strength (HF Mult)"
-                        }),
-                        "sigma": ("FLOAT", {
-                            "default": 5.0,
-                            "min": 0.01,
-                            "max": 20.0,
-                            "step": 0.01,
-                            "label": "Frequency Split Sigma"
-                        }),
-                        "denoise_threshold": ("FLOAT", {
-                            "default": 0.05,
-                            "min": 0.0,
-                            "max": 1.0,
-                            "step": 0.001,
-                            "label": "Noise Threshold"
-                        }),
-                        "mask_hardness": ("FLOAT", {
-                            "default": 2.0,
-                            "min": 0.01,
-                            "max": 100.0,
-                            "step": 0.01,
-                            "label": "Mask Hardness (Transition)"
-                        }),
-                        "hf_pre_blur_sigma": ("FLOAT", {
-                            "default": 0.5, 
-                            "min": 0.0,
-                            "max": 1.0,
-                            "step": 0.01,
-                            "label": "Noise Grouping (Pre-Blur)"
-                        }),
+                        "high_freq_mult": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.01, "label": "Detail Strength (HF Mult)"}),
+                        "sigma": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 20.0, "step": 0.01, "label": "Frequency Split Sigma"}),
+                        "denoise_threshold": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.001, "label": "Noise Threshold"}),
+                        "mask_hardness": ("FLOAT", {"default": 2.0, "min": 0.01, "max": 100.0, "step": 0.01, "label": "Mask Hardness (Transition)"}),
+                        "hf_pre_blur_sigma": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 10.0, "step": 0.01, "label": "Noise Grouping (Pre-Blur)"}),
                     }
                 }
 
-    # RETURN_TYPES = ("LATENT","LATENT","LATENT","LATENT","LATENT","LATENT","LATENT","LATENT",)
     RETURN_TYPES = ("LATENT", )
     FUNCTION = "sample"
-
     CATEGORY = "sampling"
 
-    def sample(self, model, 
-            #    add_noise, 
-               noise_seed, 
-               steps, 
-               latent_image, 
-               hfe_steps,
-               cfg, sampler_name, scheduler, positive, negative, 
-            #    start_at_step, end_at_step, 
-            #    return_with_leftover_noise, 
-               denoise=1.0,
-               high_freq_mult=1.05, sigma=2, denoise_threshold=0.05, mask_hardness=2, hf_pre_blur_sigma=0.5
-            ):
+    def sample(self, model, noise_seed, steps, latent_image, hfe_steps,
+               cfg, sampler_name, scheduler, positive, negative, denoise=1.0,
+               high_freq_mult=1.05, sigma=2, denoise_threshold=0.05, mask_hardness=2, hf_pre_blur_sigma=0.5):
+        
         disable_noise = False
         latent = latent_image
-        
         force_full_denoise = True
         
         start_hfe_step = steps
