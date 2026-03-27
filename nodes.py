@@ -141,6 +141,208 @@ def HighFrequencyEnhancer(latent, high_freq_mult, sigma, denoise_threshold, mask
     return (enhanced_latent, mask_preview)
 
 
+def parse_target_channels(target_mode, custom_str, split_index, total_channels):
+    """
+    Parses the target mode and custom string to return a sorted list of valid channel indices.
+    """
+    if target_mode == "all":
+        return list(range(total_channels))
+    if target_mode == "low":
+        return list(range(min(split_index, total_channels)))
+    if target_mode == "high":
+        return list(range(min(split_index, total_channels), total_channels))
+    
+    # Custom mode parsing
+    parts = [p.strip().replace(' ', '') for p in custom_str.split(',') if p.strip()]
+    if not parts:
+        return []
+    
+    rules = []
+    for part in parts:
+        is_exclude = part.startswith('!')
+        raw = part[1:] if is_exclude else part
+        
+        if '-' in raw:
+            s_str, e_str = raw.split('-', 1)
+            if s_str.isdigit() and e_str.isdigit():
+                rules.append((is_exclude, int(s_str), int(e_str)))
+        elif raw.isdigit():
+            rules.append((is_exclude, int(raw), int(raw)))
+            
+    if not rules:
+        return []
+        
+    # If the very first rule is an exclusion, we assume the user wants to start with ALL channels.
+    # Otherwise, we start with NO channels.
+    target_set = set(range(total_channels)) if rules[0][0] else set()
+    
+    for is_exclude, start, end in rules:
+        # Handle cases where user writes ranges backwards (e.g., 10-0)
+        r_start, r_end = min(start, end), max(start, end)
+        current_range = set(range(r_start, r_end + 1))
+        
+        if is_exclude:
+            target_set.difference_update(current_range)
+        else:
+            target_set.update(current_range)
+            
+    # Finally, filter out any out-of-bounds channels to prevent tensor crashes
+    valid_channels = target_set.intersection(set(range(total_channels)))
+    return sorted(list(valid_channels))
+
+
+class LatentSharpen_lrzjason:
+    """
+    Applies Unsharp Masking to specific channels of a latent tensor.
+    Excellent for recovering texture in high-level channels without deep-frying the structure.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05, "label": "Sharpen Strength"}),
+                "sigma": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.05, "label": "Sharpen Radius (Sigma)"}),
+                "channel_target": (["all", "low", "high", "custom"], {"default": "all"}),
+                "split_index": ("INT", {"default": 64, "min": 1, "max": 512, "step": 1, "label": "Low/High Split Index"}),
+                "custom_channels": ("STRING", {"default": "64-127, !80-90", "multiline": False}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("sharpened_latent",)
+    FUNCTION = "apply_sharpen"
+    CATEGORY = "latent/enhancement"
+
+    def apply_sharpen(self, latent, strength, sigma, channel_target, split_index, custom_channels):
+        samples = latent["samples"].clone()
+        
+        is_wan = False
+        if samples.ndim == 5:
+            samples = samples.squeeze(2)
+            is_wan = True
+            
+        total_channels = samples.shape[1]
+        target_indices = parse_target_channels(channel_target, custom_channels, split_index, total_channels)
+        
+        if target_indices and strength > 0:
+            # Extract only the targeted channels for processing to save compute
+            selected_tensors = samples[:, target_indices, :, :]
+            
+            # Unsharp mask formula: Original + Strength * (Original - Blurred)
+            blurred = apply_spatial_gaussian_blur(selected_tensors, sigma)
+            sharpened = selected_tensors + strength * (selected_tensors - blurred)
+            
+            # Place sharpened channels back into the sample tensor
+            samples[:, target_indices, :, :] = sharpened
+            
+        out_latent = latent.copy()
+        if is_wan:
+            samples = samples.unsqueeze(2)
+        out_latent["samples"] = samples
+        return (out_latent,)
+
+
+class LatentBlur_lrzjason:
+    """
+    Applies a Spatial Gaussian Blur to specific channels of a latent tensor.
+    Useful for smoothing out noisy high-frequency channels.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "sigma": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 20.0, "step": 0.05, "label": "Blur Sigma"}),
+                "channel_target": (["all", "low", "high", "custom"], {"default": "all"}),
+                "split_index": ("INT", {"default": 64, "min": 1, "max": 512, "step": 1, "label": "Low/High Split Index"}),
+                "custom_channels": ("STRING", {"default": "0-63", "multiline": False}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("blurred_latent",)
+    FUNCTION = "apply_blur"
+    CATEGORY = "latent/enhancement"
+
+    def apply_blur(self, latent, sigma, channel_target, split_index, custom_channels):
+        samples = latent["samples"].clone()
+        
+        is_wan = False
+        if samples.ndim == 5:
+            samples = samples.squeeze(2)
+            is_wan = True
+            
+        total_channels = samples.shape[1]
+        target_indices = parse_target_channels(channel_target, custom_channels, split_index, total_channels)
+        
+        if target_indices and sigma > 0:
+            selected_tensors = samples[:, target_indices, :, :]
+            blurred = apply_spatial_gaussian_blur(selected_tensors, sigma)
+            samples[:, target_indices, :, :] = blurred
+            
+        out_latent = latent.copy()
+        if is_wan:
+            samples = samples.unsqueeze(2)
+        out_latent["samples"] = samples
+        return (out_latent,)
+
+
+class LatentInterpolate_lrzjason:
+    """
+    Interpolates (blends) between two latents on a per-channel basis.
+    Allows injecting high-frequency texture from one latent into the layout structure of another.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latent1": ("LATENT",),
+                "latent2": ("LATENT",),
+                "factor": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "label": "Blend Factor (0=L1, 1=L2)"}),
+                "channel_target": (["all", "low", "high", "custom"], {"default": "all"}),
+                "split_index": ("INT", {"default": 64, "min": 1, "max": 512, "step": 1, "label": "Low/High Split Index"}),
+                "custom_channels": ("STRING", {"default": "64-127", "multiline": False}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("interpolated_latent",)
+    FUNCTION = "apply_interpolation"
+    CATEGORY = "latent/enhancement"
+
+    def apply_interpolation(self, latent1, latent2, factor, channel_target, split_index, custom_channels):
+        s1 = latent1["samples"].clone()
+        s2 = latent2["samples"].clone()
+        
+        is_wan = False
+        if s1.ndim == 5:
+            s1 = s1.squeeze(2)
+            s2 = s2.squeeze(2)
+            is_wan = True
+            
+        # Ensure latents can be blended by cropping to the minimum common dimensions
+        min_b = min(s1.shape[0], s2.shape[0])
+        min_c = min(s1.shape[1], s2.shape[1])
+        min_h = min(s1.shape[2], s2.shape[2])
+        min_w = min(s1.shape[3], s2.shape[3])
+        
+        s1 = s1[:min_b, :min_c, :min_h, :min_w]
+        s2 = s2[:min_b, :min_c, :min_h, :min_w]
+            
+        target_indices = parse_target_channels(channel_target, custom_channels, split_index, min_c)
+        
+        if target_indices:
+            # Linear interpolation (lerp) specifically on targeted channels
+            s1[:, target_indices, :, :] = s1[:, target_indices, :, :] * (1.0 - factor) + s2[:, target_indices, :, :] * factor
+            
+        out_latent = latent1.copy()
+        if is_wan:
+            s1 = s1.unsqueeze(2)
+        out_latent["samples"] = s1
+        return (out_latent,)
+
+
 class LatentFrequencyEnhancer_lrzjason:
     """
     ComfyUI Node for selective latent denoising and enhancement using FFT.
@@ -233,9 +435,10 @@ class LatentGaussianBlur_lrzjason:
 
 class LatentColorAdjust_lrzjason:
     """
-    ComfyUI Node to adjust the contrast and saturation directly within the latent space.
-    Channel 0 roughly represents Luminance (where contrast is applied).
-    Channels 1+ roughly represent Chroma (where saturation is applied).
+    ComfyUI Node to adjust contrast and saturation in the latent space.
+    Incorporates a channel-split mechanism: applies full strength to low-level 
+    (structure) channels and a weighted/dampened strength to high-level (texture) 
+    channels to prevent harsh artifacts in modern multi-channel VAEs.
     """
     
     @classmethod
@@ -257,6 +460,27 @@ class LatentColorAdjust_lrzjason:
                     "step": 0.01, 
                     "label": "Saturation"
                 }),
+                "split_channel": ("INT", {
+                    "default": 64, 
+                    "min": 1, 
+                    "max": 256, 
+                    "step": 1, 
+                    "label": "Channel Split Index"
+                }),
+                "high_contrast_weight": ("FLOAT", {
+                    "default": 0.25, 
+                    "min": 0.0, 
+                    "max": 1.0, 
+                    "step": 0.01, 
+                    "label": "High-Level Contrast Weight"
+                }),
+                "high_saturation_weight": ("FLOAT", {
+                    "default": 0.25, 
+                    "min": 0.0, 
+                    "max": 1.0, 
+                    "step": 0.01, 
+                    "label": "High-Level Saturation Weight"
+                }),
             },
         }
 
@@ -265,7 +489,7 @@ class LatentColorAdjust_lrzjason:
     FUNCTION = "adjust_color"
     CATEGORY = "latent/enhancement"
 
-    def adjust_color(self, latent, contrast, saturation):
+    def adjust_color(self, latent, contrast, saturation, split_channel, high_contrast_weight, high_saturation_weight):
         samples = latent["samples"].clone()
         
         # Handle WAN format if needed
@@ -274,19 +498,41 @@ class LatentColorAdjust_lrzjason:
             samples = samples.squeeze(2)
             is_wan = True
             
+        channels = samples.shape[1]
+        
+        # Safely cap the split channel so it doesn't crash on standard 4-channel/16-channel models
+        split = min(split_channel, channels)
+        
+        # Calculate effective strengths for the high-frequency channels
+        # If contrast is 1.5 and weight is 0.25, eff_contrast = 1.0 + (0.5 * 0.25) = 1.125
+        eff_contrast = 1.0 + (contrast - 1.0) * high_contrast_weight
+        eff_saturation = 1.0 + (saturation - 1.0) * high_saturation_weight
+
         # --- 1. Contrast Adjustment ---
-        # Contrast scales the variance around the mean of each channel
         if contrast != 1.0:
             # Calculate the spatial mean of the latents [Batch, Channels, 1, 1]
             mean = samples.mean(dim=[-2, -1], keepdim=True)
-            samples = (samples - mean) * contrast + mean
             
+            # Apply to Low Channels (Structure/Layout)
+            if split > 0:
+                samples[:, :split] = (samples[:, :split] - mean[:, :split]) * contrast + mean[:, :split]
+            
+            # Apply dampened effect to High Channels (Texture/Detail)
+            if split < channels:
+                samples[:, split:] = (samples[:, split:] - mean[:, split:]) * eff_contrast + mean[:, split:]
+                
         # --- 2. Saturation Adjustment ---
-        # Color data is stored in the channels following channel 0.
-        # Multiplying these channels boosts color purity/saturation.
-        if saturation != 1.0 and samples.shape[1] > 1:
-            samples[:, 1:] = samples[:, 1:] * saturation
-            
+        # Assuming channel 0 is Luma-like, and channels 1+ are Chroma-like
+        if saturation != 1.0 and channels > 1:
+            # Apply to Low Channels (Chroma Structure)
+            if split > 1:
+                samples[:, 1:split] = samples[:, 1:split] * saturation
+                
+            # Apply dampened effect to High Channels (Chroma Detail)
+            if split < channels:
+                start_high = max(split, 1) # Ensure we don't accidentally touch channel 0
+                samples[:, start_high:] = samples[:, start_high:] * eff_saturation
+                
         # Prepare Latent Output
         adjusted_latent = latent.copy()
         if is_wan:
@@ -362,3 +608,12 @@ NODE_DISPLAY_NAME_MAPPINGS["LatentColorAdjust_lrzjason"] = "Latent Color Adjust 
 
 NODE_CLASS_MAPPINGS["HFEPostProcessor (lrzjason)"] = HFEPostProcessor
 NODE_DISPLAY_NAME_MAPPINGS["HFEPostProcessor (lrzjason)"] = "HFEPostProcessor (lrzjason)"
+
+NODE_CLASS_MAPPINGS["LatentSharpen_lrzjason"] = LatentSharpen_lrzjason
+NODE_DISPLAY_NAME_MAPPINGS["LatentSharpen_lrzjason"] = "Latent Sharpen (lrzjason)"
+
+NODE_CLASS_MAPPINGS["LatentBlur_lrzjason"] = LatentBlur_lrzjason
+NODE_DISPLAY_NAME_MAPPINGS["LatentBlur_lrzjason"] = "Latent Blur (lrzjason)"
+
+NODE_CLASS_MAPPINGS["LatentInterpolate_lrzjason"] = LatentInterpolate_lrzjason
+NODE_DISPLAY_NAME_MAPPINGS["LatentInterpolate_lrzjason"] = "Latent Interpolate (lrzjason)"
