@@ -33,36 +33,34 @@ def create_gaussian_filter(height, width, sigma, device):
     
     return gaussian
 
-def apply_spatial_gaussian_blur(tensor, sigma):
+def apply_spatial_gaussian_blur(tensor, kernel_size, sigma):
     """
-    Applies a spatial Gaussian blur. Much more accurate and artifact-free 
-    for small blur radii compared to FFT (avoids edge wrap-around).
+    Applies a spatial Gaussian blur with a strictly bounded sampling range.
     """
-    if sigma <= 0.0:
+    if sigma <= 0.0 or kernel_size < 3:
         return tensor
+        
+    # Ensure kernel size is odd
+    if kernel_size % 2 == 0:
+        kernel_size += 1
         
     device = tensor.device
     channels = tensor.shape[1]
     
-    # Calculate kernel size based on sigma (3 sigma rule)
-    k_size = int(2 * round(3.0 * sigma) + 1)
-    if k_size < 3:
-        k_size = 3
-        
     # Create 1D Gaussian kernel
-    x = torch.arange(k_size, dtype=torch.float32, device=device) - k_size // 2
+    x = torch.arange(kernel_size, dtype=torch.float32, device=device) - kernel_size // 2
     kernel_1d = torch.exp(-0.5 * (x / sigma) ** 2)
     kernel_1d = kernel_1d / kernel_1d.sum()
     
     # Create 2D kernel
     kernel_2d = kernel_1d.view(1, 1, -1, 1) * kernel_1d.view(1, 1, 1, -1)
     
-    # Expand kernel for all channels (depthwise convolution)
-    kernel_2d = kernel_2d.expand(channels, 1, k_size, k_size)
+    # Expand kernel for depthwise convolution
+    kernel_2d = kernel_2d.expand(channels, 1, kernel_size, kernel_size)
     
-    # Pad and convolve
-    pad = k_size // 2
-    padded = F.pad(tensor, (pad, pad, pad, pad), mode='reflect')
+    # Pad and convolve using 'replicate' to avoid reflection edge artifacts
+    pad = kernel_size // 2
+    padded = F.pad(tensor, (pad, pad, pad, pad), mode='replicate')
     blurred = F.conv2d(padded, kernel_2d, groups=channels)
     
     return blurred
@@ -191,69 +189,18 @@ def parse_target_channels(target_mode, custom_str, split_index, total_channels):
     return sorted(list(valid_channels))
 
 
-class LatentSharpen_lrzjason:
-    """
-    Applies Unsharp Masking to specific channels of a latent tensor.
-    Excellent for recovering texture in high-level channels without deep-frying the structure.
-    """
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "latent": ("LATENT",),
-                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05, "label": "Sharpen Strength"}),
-                "sigma": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.05, "label": "Sharpen Radius (Sigma)"}),
-                "channel_target": (["all", "low", "high", "custom"], {"default": "all"}),
-                "split_index": ("INT", {"default": 64, "min": 1, "max": 512, "step": 1, "label": "Low/High Split Index"}),
-                "custom_channels": ("STRING", {"default": "64-127, !80-90", "multiline": False}),
-            },
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("sharpened_latent",)
-    FUNCTION = "apply_sharpen"
-    CATEGORY = "latent/enhancement"
-
-    def apply_sharpen(self, latent, strength, sigma, channel_target, split_index, custom_channels):
-        samples = latent["samples"].clone()
-        
-        is_wan = False
-        if samples.ndim == 5:
-            samples = samples.squeeze(2)
-            is_wan = True
-            
-        total_channels = samples.shape[1]
-        target_indices = parse_target_channels(channel_target, custom_channels, split_index, total_channels)
-        
-        if target_indices and strength > 0:
-            # Extract only the targeted channels for processing to save compute
-            selected_tensors = samples[:, target_indices, :, :]
-            
-            # Unsharp mask formula: Original + Strength * (Original - Blurred)
-            blurred = apply_spatial_gaussian_blur(selected_tensors, sigma)
-            sharpened = selected_tensors + strength * (selected_tensors - blurred)
-            
-            # Place sharpened channels back into the sample tensor
-            samples[:, target_indices, :, :] = sharpened
-            
-        out_latent = latent.copy()
-        if is_wan:
-            samples = samples.unsqueeze(2)
-        out_latent["samples"] = samples
-        return (out_latent,)
-
-
 class LatentBlur_lrzjason:
     """
     Applies a Spatial Gaussian Blur to specific channels of a latent tensor.
-    Useful for smoothing out noisy high-frequency channels.
+    Sampling range is strictly bounded by kernel_size to prevent latent bleeding.
     """
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "latent": ("LATENT",),
-                "sigma": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 20.0, "step": 0.05, "label": "Blur Sigma"}),
+                "kernel_size": ("INT", {"default": 3, "min": 3, "max": 31, "step": 2, "label": "Sampling Range (Kernel)"}),
+                "sigma": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 20.0, "step": 0.05, "label": "Blur Intensity (Sigma)"}),
                 "channel_target": (["all", "low", "high", "custom"], {"default": "all"}),
                 "split_index": ("INT", {"default": 64, "min": 1, "max": 512, "step": 1, "label": "Low/High Split Index"}),
                 "custom_channels": ("STRING", {"default": "0-63", "multiline": False}),
@@ -265,7 +212,7 @@ class LatentBlur_lrzjason:
     FUNCTION = "apply_blur"
     CATEGORY = "latent/enhancement"
 
-    def apply_blur(self, latent, sigma, channel_target, split_index, custom_channels):
+    def apply_blur(self, latent, kernel_size, sigma, channel_target, split_index, custom_channels):
         samples = latent["samples"].clone()
         
         is_wan = False
@@ -278,8 +225,64 @@ class LatentBlur_lrzjason:
         
         if target_indices and sigma > 0:
             selected_tensors = samples[:, target_indices, :, :]
-            blurred = apply_spatial_gaussian_blur(selected_tensors, sigma)
+            blurred = apply_spatial_gaussian_blur(selected_tensors, kernel_size, sigma)
             samples[:, target_indices, :, :] = blurred
+            
+        out_latent = latent.copy()
+        if is_wan:
+            samples = samples.unsqueeze(2)
+        out_latent["samples"] = samples
+        return (out_latent,)
+
+
+class LatentSharpen_lrzjason:
+    """
+    Applies bounded Unsharp Masking to specific channels of a latent tensor.
+    Includes an artifact_limit clamp to prevent the VAE from deep-frying.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05, "label": "Sharpen Strength"}),
+                "kernel_size": ("INT", {"default": 3, "min": 3, "max": 31, "step": 2, "label": "Sampling Range (Kernel)"}),
+                "sigma": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.05, "label": "Blur Radius (Sigma)"}),
+                "channel_target": (["all", "low", "high", "custom"], {"default": "all"}),
+                "split_index": ("INT", {"default": 64, "min": 1, "max": 512, "step": 1, "label": "Low/High Split Index"}),
+                "custom_channels": ("STRING", {"default": "64-127, !80-90", "multiline": False}),
+                "artifact_limit": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 20.0, "step": 0.1, "label": "Anti-Bleed Clamp"}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("sharpened_latent",)
+    FUNCTION = "apply_sharpen"
+    CATEGORY = "latent/enhancement"
+
+    def apply_sharpen(self, latent, strength, kernel_size, sigma, channel_target, split_index, custom_channels, artifact_limit):
+        samples = latent["samples"].clone()
+        
+        is_wan = False
+        if samples.ndim == 5:
+            samples = samples.squeeze(2)
+            is_wan = True
+            
+        total_channels = samples.shape[1]
+        target_indices = parse_target_channels(channel_target, custom_channels, split_index, total_channels)
+        
+        if target_indices and strength > 0:
+            selected_tensors = samples[:, target_indices, :, :]
+            
+            # Unsharp mask formula
+            blurred = apply_spatial_gaussian_blur(selected_tensors, kernel_size, sigma)
+            sharpened = selected_tensors + strength * (selected_tensors - blurred)
+            
+            # Anti-Artifact Clamp (prevents VAE blowout)
+            if artifact_limit > 0.0:
+                sharpened = torch.clamp(sharpened, min=-artifact_limit, max=artifact_limit)
+            
+            samples[:, target_indices, :, :] = sharpened
             
         out_latent = latent.copy()
         if is_wan:
