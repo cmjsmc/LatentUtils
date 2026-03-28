@@ -542,6 +542,111 @@ class LatentColorAdjust_lrzjason:
         return (adjusted_latent,)
 
 
+class LatentMathExplorer_lrzjason:
+    """
+    An experimental node to discover how manipulating latent mathematics 
+    affects the decoded image. Test variance, means, magnitudes, and local vs global processing.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "operation": (["scale_variance", "shift_mean", "scale_magnitude", "power_curve", "threshold_boost"],),
+                "calc_mode": (["per_channel", "global"],),
+                "factor": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01, "label": "Operation Factor"}),
+                "channel_target": (["all", "low", "high", "custom"], {"default": "all"}),
+                "split_index": ("INT", {"default": 64, "min": 1, "max": 512, "step": 1, "label": "HF Split Index"}),
+                "custom_channels": ("STRING", {"default": "0-15", "multiline": False}),
+                "high_freq_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "label": "HF Dampening Weight"}),
+                "artifact_limit": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 20.0, "step": 0.1, "label": "Anti-Bleed Clamp (0=Off)"}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("explored_latent",)
+    FUNCTION = "explore_math"
+    CATEGORY = "latent/experimental"
+
+    def explore_math(self, latent, operation, calc_mode, factor, channel_target, 
+                     split_index, custom_channels, high_freq_weight, artifact_limit):
+                     
+        samples = latent["samples"].clone()
+        
+        is_wan = False
+        if samples.ndim == 5:
+            samples = samples.squeeze(2)
+            is_wan = True
+            
+        total_channels = samples.shape[1]
+        target_indices = parse_target_channels(channel_target, custom_channels, split_index, total_channels)
+        
+        if not target_indices:
+            return (latent,) # Do nothing if no channels selected
+            
+        # Extract only targeted channels to modify
+        selected = samples[:, target_indices, :, :]
+        
+        # Determine the "neutral" value based on the operation
+        # Additive ops (shift, threshold) use 0.0. Multiplicative ops (scale, power) use 1.0.
+        is_additive = operation in ["shift_mean", "threshold_boost"]
+        neutral_val = 0.0 if is_additive else 1.0
+        
+        # Build a multiplier tensor to handle High-Frequency dampening natively
+        factor_tensor = torch.full((1, len(target_indices), 1, 1), neutral_val, device=samples.device, dtype=samples.dtype)
+        
+        for i, ch in enumerate(target_indices):
+            if ch >= split_index:
+                # Calculate dampened factor for High Frequencies
+                eff_factor = neutral_val + (factor - neutral_val) * high_freq_weight
+                factor_tensor[0, i, 0, 0] = eff_factor
+            else:
+                factor_tensor[0, i, 0, 0] = factor
+
+        # Calculate Mean (Per-Channel vs Global across all targeted channels)
+        if calc_mode == "per_channel":
+            mean = selected.mean(dim=[-2, -1], keepdim=True)
+        else: # global
+            mean = selected.mean(dim=[-3, -2, -1], keepdim=True)
+
+        # --- Apply the Experimental Math Operations ---
+        if operation == "scale_variance":
+            # (x - mean) * factor + mean
+            processed = (selected - mean) * factor_tensor + mean
+            
+        elif operation == "shift_mean":
+            # x + factor
+            processed = selected + factor_tensor
+            
+        elif operation == "scale_magnitude":
+            # x * factor (does not respect the mean)
+            processed = selected * factor_tensor
+            
+        elif operation == "power_curve":
+            # non-linear push: sign(x-mean) * abs(x-mean)^factor + mean
+            diff = selected - mean
+            # safeguard against fractional powers of negative numbers
+            processed = torch.sign(diff) * (torch.abs(diff) ** factor_tensor) + mean
+            
+        elif operation == "threshold_boost":
+            # If above mean, + factor. If below mean, - factor.
+            processed = torch.where(selected > mean, selected + factor_tensor, selected - factor_tensor)
+
+        # --- Recombination and Anti-Artifact Clamping ---
+        if artifact_limit > 0.0:
+            processed = torch.clamp(processed, min=-artifact_limit, max=artifact_limit)
+            
+        # Put processed channels back into the main tensor
+        samples[:, target_indices, :, :] = processed
+
+        out_latent = latent.copy()
+        if is_wan:
+            samples = samples.unsqueeze(2)
+        out_latent["samples"] = samples
+        return (out_latent,)
+
+
 class HFEPostProcessor:
     """
     Custom sampler with high-frequency enhancement during sampling process.
@@ -617,3 +722,6 @@ NODE_DISPLAY_NAME_MAPPINGS["LatentBlur_lrzjason"] = "Latent Blur (lrzjason)"
 
 NODE_CLASS_MAPPINGS["LatentInterpolate_lrzjason"] = LatentInterpolate_lrzjason
 NODE_DISPLAY_NAME_MAPPINGS["LatentInterpolate_lrzjason"] = "Latent Interpolate (lrzjason)"
+
+NODE_CLASS_MAPPINGS["LatentMathExplorer_lrzjason"] = LatentMathExplorer_lrzjason
+NODE_DISPLAY_NAME_MAPPINGS["LatentMathExplorer_lrzjason"] = "Latent Math Explorer (lrzjason)"
