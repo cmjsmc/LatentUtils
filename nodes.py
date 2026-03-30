@@ -549,6 +549,8 @@ class LatentMathExplorer_lrzjason:
     """
     An experimental node to discover how manipulating latent mathematics 
     affects the decoded image. Test variance, means, magnitudes, and local vs global processing.
+    Unified UI: A factor of 1.0 is ALWAYS neutral for every operation.
+    Includes Soft Clipping (Tanh) to prevent VAE grid/ghosting artifacts.
     """
     
     @classmethod
@@ -558,12 +560,13 @@ class LatentMathExplorer_lrzjason:
                 "latent": ("LATENT",),
                 "operation": (["scale_variance", "shift_mean", "scale_magnitude", "power_curve", "threshold_boost"],),
                 "calc_mode": (["per_channel", "global"],),
-                "factor": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01, "label": "Operation Factor"}),
+                "factor": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05, "label": "Operation Factor (1.0 = Neutral)"}),
                 "channel_target": (["all", "low", "high", "custom"], {"default": "all"}),
                 "split_index": ("INT", {"default": 64, "min": 1, "max": 512, "step": 1, "label": "HF Split Index"}),
                 "custom_channels": ("STRING", {"default": "0-15", "multiline": False}),
                 "high_freq_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "label": "HF Dampening Weight"}),
-                "artifact_limit": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 20.0, "step": 0.1, "label": "Anti-Bleed Clamp (0=Off)"}),
+                "limit_mode": (["soft_clip_tanh", "hard_clamp", "off"], {"default": "soft_clip_tanh"}),
+                "artifact_limit": ("FLOAT", {"default": 3.5, "min": 0.1, "max": 20.0, "step": 0.1, "label": "Artifact Limit"}),
             },
         }
 
@@ -573,7 +576,7 @@ class LatentMathExplorer_lrzjason:
     CATEGORY = "latent/experimental"
 
     def explore_math(self, latent, operation, calc_mode, factor, channel_target, 
-                     split_index, custom_channels, high_freq_weight, artifact_limit):
+                     split_index, custom_channels, high_freq_weight, limit_mode, artifact_limit):
                      
         samples = latent["samples"].clone()
         
@@ -586,61 +589,55 @@ class LatentMathExplorer_lrzjason:
         target_indices = parse_target_channels(channel_target, custom_channels, split_index, total_channels)
         
         if not target_indices:
-            return (latent,) # Do nothing if no channels selected
+            return (latent,)
             
-        # Extract only targeted channels to modify
         selected = samples[:, target_indices, :, :]
         
-        # Determine the "neutral" value based on the operation
-        # Additive ops (shift, threshold) use 0.0. Multiplicative ops (scale, power) use 1.0.
-        is_additive = operation in ["shift_mean", "threshold_boost"]
-        neutral_val = 0.0 if is_additive else 1.0
-        
-        # Build a multiplier tensor to handle High-Frequency dampening natively
+        # Neutral value is now ALWAYS 1.0 for the UI
+        neutral_val = 1.0
         factor_tensor = torch.full((1, len(target_indices), 1, 1), neutral_val, device=samples.device, dtype=samples.dtype)
         
         for i, ch in enumerate(target_indices):
             if ch >= split_index:
-                # Calculate dampened factor for High Frequencies
                 eff_factor = neutral_val + (factor - neutral_val) * high_freq_weight
                 factor_tensor[0, i, 0, 0] = eff_factor
             else:
                 factor_tensor[0, i, 0, 0] = factor
 
-        # Calculate Mean (Per-Channel vs Global across all targeted channels)
         if calc_mode == "per_channel":
             mean = selected.mean(dim=[-2, -1], keepdim=True)
-        else: # global
+        else:
             mean = selected.mean(dim=[-3, -2, -1], keepdim=True)
 
-        # --- Apply the Experimental Math Operations ---
+        # --- Math Operations ---
         if operation == "scale_variance":
-            # (x - mean) * factor + mean
             processed = (selected - mean) * factor_tensor + mean
             
         elif operation == "shift_mean":
-            # x + factor
-            processed = selected + factor_tensor
+            # Convert the 1.0-based factor into a raw additive offset (1.0 -> 0.0, 1.1 -> +0.1)
+            offset = factor_tensor - 1.0
+            processed = selected + offset
             
         elif operation == "scale_magnitude":
-            # x * factor (does not respect the mean)
             processed = selected * factor_tensor
             
         elif operation == "power_curve":
-            # non-linear push: sign(x-mean) * abs(x-mean)^factor + mean
             diff = selected - mean
-            # safeguard against fractional powers of negative numbers
             processed = torch.sign(diff) * (torch.abs(diff) ** factor_tensor) + mean
             
         elif operation == "threshold_boost":
-            # If above mean, + factor. If below mean, - factor.
-            processed = torch.where(selected > mean, selected + factor_tensor, selected - factor_tensor)
+            # Convert the 1.0-based factor into a raw additive offset
+            offset = factor_tensor - 1.0
+            processed = torch.where(selected > mean, selected + offset, selected - offset)
 
-        # --- Recombination and Anti-Artifact Clamping ---
-        if artifact_limit > 0.0:
+        # --- Advanced Anti-Artifact Handling ---
+        if limit_mode == "hard_clamp":
             processed = torch.clamp(processed, min=-artifact_limit, max=artifact_limit)
             
-        # Put processed channels back into the main tensor
+        elif limit_mode == "soft_clip_tanh":
+            # limit * tanh(value / limit) - Smooth curve that prevents VAE artifacts
+            processed = artifact_limit * torch.tanh(processed / artifact_limit)
+
         samples[:, target_indices, :, :] = processed
 
         out_latent = latent.copy()
